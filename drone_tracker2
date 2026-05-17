@@ -1,0 +1,145 @@
+import cv2
+from ultralytics import YOLO
+import numpy as np
+from collections import deque
+
+model = YOLO('/home/muhammad-ghuzaif/Downloads/yolo_project/best.pt')
+
+# ─── Background Subtractor Setup ───────────────────────────────────────────────
+# history=500: kitne frames se background seekhe
+# varThreshold=50: zyada = sirf fast movement detect ho (drone ke liye 40-60 rakho)
+# detectShadows=True: shadow bhi detect kare (False karo agar shadows problem karein)
+bg_subtractor = cv2.createBackgroundSubtractorMOG2(
+    history=500,
+    varThreshold=50,
+    detectShadows=True
+)
+
+# Morphological operations ke liye kernel
+kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+
+trajectories = {}
+colors = [(0, 0, 255), (0, 255, 0), (255, 0, 0), (0, 255, 255), (255, 0, 255)]
+
+cap = cv2.VideoCapture(0)
+print("✅ Background Subtraction wala Drone Tracker chal raha hai! Q dabao band karne ke liye")
+
+
+def get_foreground_mask(frame):
+    """
+    Clean foreground mask banata hai:
+    1. MOG2 se raw mask lo
+    2. Noise remove karo (erode)
+    3. Drone-sized blobs banao (dilate)
+    """
+    fg_mask = bg_subtractor.apply(frame)
+
+    # Shadow pixels (127) ko background (0) banao
+    _, fg_mask = cv2.threshold(fg_mask, 200, 255, cv2.THRESH_BINARY)
+
+    # Salt-and-pepper noise hata do
+    fg_mask = cv2.erode(fg_mask, kernel, iterations=1)
+
+    # Small holes fill karo taake drone ka pura area cover ho
+    fg_mask = cv2.dilate(fg_mask, kernel, iterations=3)
+
+    return fg_mask
+
+
+def is_drone_moving(box, fg_mask, threshold=0.25):
+    """
+    Check karta hai k YOLO ka detected box foreground mein hai ya nahi.
+    threshold=0.25 → agar box ka 25% hissa moving ho to drone maano
+    Zyada karo (0.5) = strict, Kam karo (0.1) = lenient
+    """
+    x1, y1, x2, y2 = box
+    roi = fg_mask[y1:y2, x1:x2]
+
+    if roi.size == 0:
+        return False
+
+    # Foreground pixels ka ratio nikalo
+    foreground_ratio = np.count_nonzero(roi) / roi.size
+    return foreground_ratio > threshold
+
+
+while True:
+    ret, frame = cap.read()
+    if not ret:
+        break
+
+    # ─── Foreground Mask ──────────────────────────────────────────────────────
+    fg_mask = get_foreground_mask(frame)
+
+    # ─── YOLO Detection ───────────────────────────────────────────────────────
+    results = model.predict(frame, conf=0.5, verbose=False)
+
+    current_drones = []
+    drone_counter = 0  # Sirf confirmed drones ko count karo
+
+    for r in results:
+        boxes = r.boxes.xyxy.cpu().numpy()
+        confs = r.boxes.conf.cpu().numpy()
+
+        for i, box in enumerate(boxes):
+            x1, y1, x2, y2 = int(box[0]), int(box[1]), int(box[2]), int(box[3])
+
+            # ── KEY CHECK: Kya ye box foreground mein hai? ──────────────────
+            if not is_drone_moving((x1, y1, x2, y2), fg_mask, threshold=0.25):
+                # Static object hai, skip karo
+                # Debug ke liye: gray box draw karo
+                cv2.rectangle(frame, (x1, y1), (x2, y2), (128, 128, 128), 1)
+                cv2.putText(frame, "Static-Skip", (x1, y1 - 5),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, (128, 128, 128), 1)
+                continue
+            # ────────────────────────────────────────────────────────────────
+
+            x_center = int((x1 + x2) / 2)
+            y_center = int((y1 + y2) / 2)
+
+            drone_id = drone_counter
+            drone_counter += 1
+            color = colors[drone_id % len(colors)]
+
+            if drone_id not in trajectories:
+                trajectories[drone_id] = deque(maxlen=30)
+
+            trajectories[drone_id].appendleft((x_center, y_center))
+            current_drones.append(drone_id)
+
+            # Bounding box
+            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+
+            # Drone ID
+            cv2.putText(frame, f"Drone {drone_id + 1}", (x1, y1 - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+
+            # Confidence
+            cv2.putText(frame, f"{confs[i]:.2f}", (x1, y2 + 20),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+
+    # ─── Trajectories Draw ────────────────────────────────────────────────────
+    for drone_id, pts in trajectories.items():
+        color = colors[drone_id % len(colors)]
+        for j in range(1, len(pts)):
+            if pts[j - 1] is None or pts[j] is None:
+                continue
+            thickness = int(np.sqrt(30 / float(j + 1)) * 2.5)
+            cv2.line(frame, pts[j - 1], pts[j], color, thickness)
+
+    # ─── Info Display ─────────────────────────────────────────────────────────
+    cv2.putText(frame, f"Drones Detected: {len(current_drones)}", (20, 40),
+                cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+
+    # Foreground mask bhi dikhao (debug ke liye - band karna ho to comment karo)
+    fg_display = cv2.cvtColor(fg_mask, cv2.COLOR_GRAY2BGR)
+    fg_display = cv2.resize(fg_display, (320, 240))
+    frame[0:240, frame.shape[1] - 320:] = fg_display  # Top-right corner mein
+
+    cv2.imshow("Drone Tracker + BG Subtraction", frame)
+
+    if cv2.waitKey(1) & 0xFF == ord('q'):
+        break
+
+cap.release()
+cv2.destroyAllWindows()

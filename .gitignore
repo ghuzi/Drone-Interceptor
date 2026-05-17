@@ -1,0 +1,9 @@
+venv/
+*.pt
+*.jpg
+*.jpeg
+*.png
+*.webp
+*.avif
+runs/
+__pycache__/
